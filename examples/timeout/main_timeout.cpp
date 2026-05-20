@@ -1,6 +1,17 @@
 //
 // Created by kirill on 1/13/26.
 //
+// Demonstrates the optional per-command timeout introduced for RedisClient
+// and RedisClusterClient. Two ways to set it:
+//   1) RedisClusterConfig::command_timeout_ms — default budget for every
+//      command. Pass 0 (default) to disable.
+//   2) command_timed(timeout_ms, ...) — per-call budget that overrides (1).
+//
+// On expiration the caller receives RedisErrorCategory::Timeout and is
+// guaranteed to exit promptly. In cluster mode the slot mapping is
+// invalidated, so the next command will rediscover the topology before
+// going to a node.
+//
 
 #include <chrono>
 #include <cstdint>
@@ -18,14 +29,26 @@ using namespace std::chrono_literals;
 usub::uvent::task::Awaitable<void> test_reconnect(usub::uredis::RedisClusterClient& redis_client) {
     std::uint64_t ok = 0;
     std::uint64_t fail = 0;
+    std::uint64_t timed_out = 0;
 
     for (;;) {
-        auto res = co_await redis_client.command("HGET", "fx:rates", "USD");
+        // Per-call 500ms budget — overrides any config-level default and
+        // guarantees we never wait longer than that, regardless of how
+        // sick the cluster is.
+        auto res = co_await redis_client.command_timed(500, "HGET", "fx:rates", "USD");
 
         if (!res) {
-            ++fail;
             const auto& e = res.error();
-            usub::ulog::error("HGET failed: ({}) ok={} fail={}", e.message, ok, fail);
+            if (e.category == usub::uredis::RedisErrorCategory::Timeout) {
+                ++timed_out;
+                usub::ulog::warn("HGET timed out (cluster mapping will be rebuilt on next call): "
+                                 "msg=\"{}\" ok={} fail={} timeout={}",
+                                 e.message, ok, fail, timed_out);
+            } else {
+                ++fail;
+                usub::ulog::error("HGET failed: ({}) ok={} fail={} timeout={}",
+                                  e.message, ok, fail, timed_out);
+            }
 
             co_await usub::uvent::system::this_coroutine::sleep_for(200ms);
             continue;
@@ -33,10 +56,12 @@ usub::uvent::task::Awaitable<void> test_reconnect(usub::uredis::RedisClusterClie
 
         const usub::uredis::RedisValue& v = res.value();
         if (v.is_null()) {
-            usub::ulog::warn("No rate for USD (key missing?) ok={} fail={}", ok, fail);
+            usub::ulog::warn("No rate for USD (key missing?) ok={} fail={} timeout={}",
+                             ok, fail, timed_out);
         } else {
             ++ok;
-            usub::ulog::info("USD:{} ok={} fail={}", v.as_string(), ok, fail);
+            usub::ulog::info("USD:{} ok={} fail={} timeout={}",
+                             v.as_string(), ok, fail, timed_out);
         }
 
         co_await usub::uvent::system::this_coroutine::sleep_for(200ms);
@@ -80,6 +105,10 @@ int main() {
         .password = keydb_pswd,
         .connect_timeout_ms = 2000,
         .io_timeout_ms = 2000,
+        // Default budget for any command issued via command(...) without an
+        // explicit timeout. The coroutine above uses command_timed(500, ...)
+        // to override this on a per-call basis.
+        .command_timeout_ms = 1000,
         .max_connections_per_node = 16
     };
 

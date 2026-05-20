@@ -128,3 +128,16 @@ Sentinel integration in uRedis provides:
 * Full compatibility with all uRedis features
 
 It is designed to match `RedisClusterClient` API style, but focused on **master election** rather than sharded routing.
+
+## Timeouts
+
+The default master command timeout is taken from `cfg.base_redis.command_timeout_ms` (see [client.md](client.md)). For per-call control, `RedisSentinelPool` exposes `command_timed`:
+
+```cpp
+auto r = co_await sp.command_timed(1000, "GET", "key");
+if (!r && r.error().category == RedisErrorCategory::Timeout) {
+    // returned within 1s
+}
+```
+
+When `command_timed` (or any command using `command_timeout_ms`) hits the budget, the call returns `RedisErrorCategory::Timeout` and the cached master is dropped. The next call re-resolves the master through the sentinels — useful when a timeout indicates a stale master after failover.

@@ -200,7 +200,29 @@ namespace usub::uredis {
         return out;
     }
 
-    task::Awaitable<RedisResult<RedisValue> > RedisClient::read_one_reply_unlocked() {
+    static inline std::int64_t monotonic_now_ms() noexcept {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Returns the per-IO timeout to use given an optional command deadline.
+    // out: timeout in ms to pass to socket update_timeout (>= 1)
+    // returns false iff the deadline has already expired (caller must bail with Timeout)
+    static inline bool compute_io_timeout(std::int64_t deadline_ms, int io_timeout_ms, int &out) noexcept {
+        if (deadline_ms <= 0) {
+            out = io_timeout_ms;
+            return true;
+        }
+        const auto rem = deadline_ms - monotonic_now_ms();
+        if (rem <= 0) return false;
+        std::int64_t cap = io_timeout_ms > 0 ? static_cast<std::int64_t>(io_timeout_ms) : rem;
+        std::int64_t t = rem < cap ? rem : cap;
+        if (t < 1) t = 1;
+        out = static_cast<int>(t);
+        return true;
+    }
+
+    task::Awaitable<RedisResult<RedisValue> > RedisClient::read_one_reply_unlocked(std::int64_t deadline_ms) {
         if (!socket_)
             co_return std::unexpected(RedisError{RedisErrorCategory::Io, "socket is null"});
 
@@ -216,7 +238,13 @@ namespace usub::uredis {
             }
 
             buf.clear();
-            socket_->update_timeout(config_.io_timeout_ms);
+
+            int io_to = 0;
+            if (!compute_io_timeout(deadline_ms, config_.io_timeout_ms, io_to)) {
+                hard_close_socket_unlocked();
+                co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout (read deadline)"});
+            }
+            socket_->update_timeout(io_to);
 
             constexpr std::size_t max_read = 64 * 1024;
             const ssize_t rdsz = co_await socket_->async_read(buf, max_read);
@@ -227,7 +255,10 @@ namespace usub::uredis {
 #endif
 
             if (rdsz <= 0) {
+                const bool timed_out = deadline_ms > 0 && monotonic_now_ms() >= deadline_ms;
                 hard_close_socket_unlocked();
+                if (timed_out)
+                    co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout (read)"});
                 co_return std::unexpected(RedisError{RedisErrorCategory::Io, "connection closed"});
             }
 
@@ -237,7 +268,8 @@ namespace usub::uredis {
 
     task::Awaitable<RedisResult<RedisValue> > RedisClient::send_and_read_unlocked(
         std::string_view cmd,
-        std::span<const std::string_view> args) {
+        std::span<const std::string_view> args,
+        std::int64_t deadline_ms) {
         if (!connected_ || closing_)
             co_return std::unexpected(RedisError{RedisErrorCategory::Io, "not connected"});
         if (!socket_)
@@ -247,7 +279,13 @@ namespace usub::uredis {
 
         std::size_t off = 0;
         while (off < frame.size()) {
-            socket_->update_timeout(config_.io_timeout_ms);
+            int io_to = 0;
+            if (!compute_io_timeout(deadline_ms, config_.io_timeout_ms, io_to)) {
+                hard_close_socket_unlocked();
+                co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout (write deadline)"});
+            }
+            socket_->update_timeout(io_to);
+
             const ssize_t n = co_await socket_->async_write(frame.data() + off, frame.size() - off);
 
 #ifdef UREDIS_LOGS
@@ -256,35 +294,68 @@ namespace usub::uredis {
 #endif
 
             if (n <= 0) {
+                const bool timed_out = deadline_ms > 0 && monotonic_now_ms() >= deadline_ms;
                 hard_close_socket_unlocked();
+                if (timed_out)
+                    co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout (write)"});
                 co_return std::unexpected(RedisError{RedisErrorCategory::Io, "write failed"});
             }
             off += static_cast<std::size_t>(n);
         }
 
-        co_return co_await read_one_reply_unlocked();
+        co_return co_await read_one_reply_unlocked(deadline_ms);
     }
 
     task::Awaitable<RedisResult<RedisValue> > RedisClient::command(
         std::string_view cmd,
         std::span<const std::string_view> args) {
-        bool expected = false;
+        co_return co_await command_impl(cmd, args, config_.command_timeout_ms);
+    }
 
+    task::Awaitable<RedisResult<RedisValue> > RedisClient::command_timed(
+        std::string_view cmd,
+        std::span<const std::string_view> args,
+        int timeout_ms) {
+        co_return co_await command_impl(cmd, args, timeout_ms);
+    }
+
+    task::Awaitable<RedisResult<RedisValue> > RedisClient::command_impl(
+        std::string_view cmd,
+        std::span<const std::string_view> args,
+        int timeout_ms) {
         if (!connected_ || closing_ || !socket_) {
             auto c = co_await connect_unlocked();
             if (!c) co_return std::unexpected(c.error());
         }
 
+        // Compute monotonic deadline once for the whole command (covers both
+        // attempts when a transient IO error triggers a reconnect+retry).
+        // timeout_ms <= 0 disables the deadline (legacy per-IO behavior).
+        const std::int64_t deadline_ms = (timeout_ms > 0)
+                                             ? (monotonic_now_ms() + static_cast<std::int64_t>(timeout_ms))
+                                             : 0;
+
         for (int attempt = 0; attempt < 2; ++attempt) {
 #ifdef UREDIS_LOGS
-            ulog::debug("RedisClient::command: attempt={} this={} cmd=\"{}\" argc={} socket={}",
-                        attempt, ptr_id(this), std::string(cmd), args.size(), ptr_id(socket_.get()));
+            ulog::debug("RedisClient::command: attempt={} this={} cmd=\"{}\" argc={} socket={} deadline_ms={}",
+                        attempt, ptr_id(this), std::string(cmd), args.size(), ptr_id(socket_.get()),
+                        static_cast<long long>(deadline_ms));
 #endif
 
-            auto r = co_await send_and_read_unlocked(cmd, args);
+            // Bail out early if the user budget is already gone.
+            if (deadline_ms > 0 && monotonic_now_ms() >= deadline_ms) {
+                hard_close_socket_unlocked();
+                co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout"});
+            }
+
+            auto r = co_await send_and_read_unlocked(cmd, args, deadline_ms);
             if (r) co_return r;
 
             const auto &e = r.error();
+
+            // Never retry on Timeout: the caller's budget is the contract.
+            if (e.category == RedisErrorCategory::Timeout)
+                co_return std::unexpected(e);
 
             if (e.category == RedisErrorCategory::Io && attempt == 0) {
 #ifdef UREDIS_LOGS

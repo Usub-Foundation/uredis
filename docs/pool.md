@@ -16,6 +16,10 @@ struct RedisPoolConfig
 
     int connect_timeout_ms{5000};
     int io_timeout_ms{5000};
+
+    // Optional total budget per command, forwarded to each pooled
+    // RedisClient. 0 = disabled (default). See docs/client.md.
+    int command_timeout_ms{0};
 };
 
 class RedisPool
@@ -31,6 +35,18 @@ public:
 
     template <typename... Args>
     task::Awaitable<RedisResult<RedisValue>> command(
+        std::string_view cmd,
+        Args&&... args);
+
+    // Per-call timeout override (see RedisClient::command_timed).
+    task::Awaitable<RedisResult<RedisValue>> command_timed(
+        std::string_view cmd,
+        std::span<const std::string_view> args,
+        int timeout_ms);
+
+    template <typename... Args>
+    task::Awaitable<RedisResult<RedisValue>> command_timed(
+        int timeout_ms,
         std::string_view cmd,
         Args&&... args);
 };

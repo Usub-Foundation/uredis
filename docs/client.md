@@ -15,6 +15,12 @@ struct RedisConfig {
 
     int connect_timeout_ms{5000};
     int io_timeout_ms{5000};
+
+    // Optional total budget for a single command (0 = disabled, default).
+    // When set, the call returns RedisErrorCategory::Timeout if the budget
+    // expires before the reply arrives, and the connection is hard-closed
+    // so the caller can always exit.
+    int command_timeout_ms{0};
 };
 
 class RedisClient {
@@ -29,6 +35,19 @@ public:
 
     template <typename... Args>
     task::Awaitable<RedisResult<RedisValue>> command(
+        std::string_view cmd,
+        Args&&... args);
+
+    // Per-call timeout overrides RedisConfig::command_timeout_ms.
+    // Pass 0 to disable for this specific call.
+    task::Awaitable<RedisResult<RedisValue>> command_timed(
+        std::string_view cmd,
+        std::span<const std::string_view> args,
+        int timeout_ms);
+
+    template <typename... Args>
+    task::Awaitable<RedisResult<RedisValue>> command_timed(
+        int timeout_ms,
         std::string_view cmd,
         Args&&... args);
 
@@ -200,7 +219,45 @@ Most API returns `RedisResult<T> = std::expected<T, RedisError>`:
 ```cpp
 if (!resp) {
     const RedisError& err = resp.error();
-    // err.category: Io / Protocol / ServerReply
+    // err.category: Io / Protocol / ServerReply / Timeout
     // err.message: string
 }
 ```
+
+## Timeouts
+
+There are two layers of timeouts:
+
+- `io_timeout_ms` — per-IO socket timeout. Bounds the time a single `read`
+  or `write` syscall may block. Always on.
+- `command_timeout_ms` — optional total budget for a single logical command
+  (write + parse + read). `0` (default) disables this layer.
+
+When a command exceeds `command_timeout_ms`, the call returns
+`RedisErrorCategory::Timeout`, the underlying socket is hard-closed, and the
+next call on the same `RedisClient` will reconnect. This guarantees the
+caller can always exit within the configured budget, even when the server
+stops sending data mid-reply.
+
+Two ways to set it:
+
+```cpp
+// 1) Config default for every command.
+RedisConfig cfg{
+    .host = "127.0.0.1",
+    .port = 6379,
+    .io_timeout_ms = 5000,
+    .command_timeout_ms = 2000, // 2s budget per command
+};
+RedisClient client{cfg};
+
+auto r = co_await client.get("key"); // bounded by 2s
+
+// 2) Per-call override (wins over the config value).
+auto r2 = co_await client.command_timed(500, "BLPOP", "queue", "0");
+if (!r2 && r2.error().category == RedisErrorCategory::Timeout) {
+    // caller is back in 500ms regardless of server state
+}
+```
+
+`command_timed(0, ...)` disables the budget for that one call.

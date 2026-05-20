@@ -182,7 +182,8 @@ namespace usub::uredis
     {
         Io,
         Protocol,
-        ServerReply
+        ServerReply,
+        Timeout
     };
 
     struct RedisError

@@ -81,6 +81,18 @@ namespace usub::uredis
 
         auto err = res.error();
 
+        // Timeout: contract is "always exit promptly" — do NOT retry. Drop
+        // the cached master so the next user command re-resolves through
+        // sentinels (the master may have failed over, which is exactly the
+        // kind of thing that causes timeouts).
+        if (err.category == RedisErrorCategory::Timeout)
+        {
+            auto guard = co_await mutex_.lock();
+            connected_ = false;
+            master_.reset();
+            co_return std::unexpected(err);
+        }
+
         if (err.category != RedisErrorCategory::Io)
             co_return std::unexpected(err);
 
@@ -101,5 +113,43 @@ namespace usub::uredis
         }
 
         co_return co_await client->command(cmd, args);
+    }
+
+    task::Awaitable<RedisResult<RedisValue>>
+    RedisSentinelPool::command_timed(std::string_view cmd,
+                                     std::span<const std::string_view> args,
+                                     int timeout_ms)
+    {
+        // Per-call deadline: cover the master-resolve + IO portion under the
+        // same budget. We don't retry on Timeout (would exceed the budget).
+        std::shared_ptr<RedisClient> client;
+
+        {
+            auto guard = co_await mutex_.lock();
+
+            auto ec = co_await ensure_connected_locked();
+            if (!ec)
+                co_return std::unexpected(ec.error());
+
+            client = master_;
+        }
+
+        auto res = co_await client->command_timed(cmd, args, timeout_ms);
+        if (res)
+            co_return res;
+
+        auto err = res.error();
+
+        // On Timeout or IO error, drop the cached master so subsequent calls
+        // re-resolve. On Timeout we do NOT retry within the same call.
+        if (err.category == RedisErrorCategory::Timeout
+            || err.category == RedisErrorCategory::Io)
+        {
+            auto guard = co_await mutex_.lock();
+            connected_ = false;
+            master_.reset();
+        }
+
+        co_return std::unexpected(err);
     }
 }

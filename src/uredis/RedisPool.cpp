@@ -22,6 +22,7 @@ namespace usub::uredis
             rc.password = this->cfg_.password;
             rc.connect_timeout_ms = this->cfg_.connect_timeout_ms;
             rc.io_timeout_ms = this->cfg_.io_timeout_ms;
+            rc.command_timeout_ms = this->cfg_.command_timeout_ms;
 
             this->clients_.push_back(std::make_shared<RedisClient>(rc));
         }
@@ -57,5 +58,22 @@ namespace usub::uredis
         auto& client = this->clients_[idx];
 
         co_return co_await client->command(cmd, args);
+    }
+
+    task::Awaitable<RedisResult<RedisValue>> RedisPool::command_timed(
+        std::string_view cmd,
+        std::span<const std::string_view> args,
+        int timeout_ms)
+    {
+        if (this->clients_.empty())
+        {
+            RedisError err{RedisErrorCategory::Io, "RedisPool has no clients"};
+            co_return std::unexpected(err);
+        }
+
+        std::size_t idx = this->rr_.fetch_add(1, std::memory_order_relaxed) % this->clients_.size();
+        auto& client = this->clients_[idx];
+
+        co_return co_await client->command_timed(cmd, args, timeout_ms);
     }
 } // namespace usub::uredis

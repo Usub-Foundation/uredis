@@ -33,6 +33,12 @@ namespace usub::uredis {
 
         int connect_timeout_ms{5000};
         int io_timeout_ms{5000};
+
+        // Optional total time budget for a single command (write + read).
+        // 0 = disabled (only per-IO timeout applies, legacy behavior).
+        // When > 0, command() returns a Timeout error if the budget is exceeded,
+        // and the underlying socket is hard-closed so callers can always exit.
+        int command_timeout_ms{0};
     };
 
     class RedisClient {
@@ -55,6 +61,24 @@ namespace usub::uredis {
         task::Awaitable<RedisResult<RedisValue> > command(std::string_view cmd, Args &&... args) {
             std::array<std::string_view, sizeof...(Args)> arr{std::string_view{std::forward<Args>(args)}...};
             co_return co_await this->command(cmd, std::span<const std::string_view>(arr.data(), arr.size()));
+        }
+
+        // Per-call timeout variant: forces a hard deadline on this single command,
+        // independent of config_.command_timeout_ms. Pass 0 to disable.
+        //
+        // On expiration the call returns RedisErrorCategory::Timeout and the
+        // underlying socket is hard-closed (next command will reconnect).
+        task::Awaitable<RedisResult<RedisValue> > command_timed(
+            std::string_view cmd,
+            std::span<const std::string_view> args,
+            int timeout_ms);
+
+        template<typename... Args>
+        task::Awaitable<RedisResult<RedisValue> > command_timed(
+            int timeout_ms, std::string_view cmd, Args &&... args) {
+            std::array<std::string_view, sizeof...(Args)> arr{std::string_view{std::forward<Args>(args)}...};
+            co_return co_await this->command_timed(
+                cmd, std::span<const std::string_view>(arr.data(), arr.size()), timeout_ms);
         }
 
         task::Awaitable<RedisResult<std::optional<std::string> > > get(std::string_view key);
@@ -113,11 +137,19 @@ namespace usub::uredis {
 
         task::Awaitable<RedisResult<void> > auth_and_select_unlocked();
 
+        // Internal entry point that drives command logic with an optional total
+        // deadline. deadline_ms is a monotonic timestamp in ms (0 = no deadline).
+        task::Awaitable<RedisResult<RedisValue> > command_impl(
+            std::string_view cmd,
+            std::span<const std::string_view> args,
+            int timeout_ms);
+
         task::Awaitable<RedisResult<RedisValue> > send_and_read_unlocked(
             std::string_view cmd,
-            std::span<const std::string_view> args);
+            std::span<const std::string_view> args,
+            std::int64_t deadline_ms = 0);
 
-        task::Awaitable<RedisResult<RedisValue> > read_one_reply_unlocked();
+        task::Awaitable<RedisResult<RedisValue> > read_one_reply_unlocked(std::int64_t deadline_ms = 0);
     };
 
     static inline void normalize_auth(std::optional<std::string> &s) {

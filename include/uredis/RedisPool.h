@@ -29,6 +29,10 @@ namespace usub::uredis
 
         int connect_timeout_ms{5000};
         int io_timeout_ms{5000};
+
+        // Optional total budget for a single command, forwarded to each
+        // underlying RedisClient. 0 = disabled (legacy behavior).
+        int command_timeout_ms{0};
     };
 
     class RedisPool
@@ -52,6 +56,26 @@ namespace usub::uredis
             co_return co_await this->command(
                 cmd,
                 std::span<const std::string_view>(arr.data(), arr.size()));
+        }
+
+        // Per-call timeout override, see RedisClient::command_timed.
+        task::Awaitable<RedisResult<RedisValue>> command_timed(
+            std::string_view cmd,
+            std::span<const std::string_view> args,
+            int timeout_ms);
+
+        template <typename... Args>
+        task::Awaitable<RedisResult<RedisValue>> command_timed(
+            int timeout_ms,
+            std::string_view cmd,
+            Args&&... args)
+        {
+            std::array<std::string_view, sizeof...(Args)> arr{
+                std::string_view{std::forward<Args>(args)}...};
+            co_return co_await this->command_timed(
+                cmd,
+                std::span<const std::string_view>(arr.data(), arr.size()),
+                timeout_ms);
         }
 
     private:

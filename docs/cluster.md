@@ -232,3 +232,49 @@ if (rates.empty())
 
 // rates["KGS"], rates["USD"], ...
 ```
+
+---
+
+# Timeouts
+
+In addition to `io_timeout_ms` (per-IO socket timeout, always on),
+`RedisClusterConfig` has an optional **`command_timeout_ms`** that caps the
+total wall-clock time of a single cluster command — including pool
+acquisition, network IO, and any MOVED/ASK hops triggered along the way.
+
+`0` (default) disables this layer, preserving legacy behavior. Set it to a
+positive value to guarantee that any `command(...)` call returns within
+that budget.
+
+```cpp
+RedisClusterConfig cfg;
+cfg.seeds              = { {"127.0.0.1", 7000} };
+cfg.command_timeout_ms = 2000;  // every command must complete within 2s
+RedisClusterClient cluster{cfg};
+```
+
+Per-call override:
+
+```cpp
+auto r = co_await cluster.command_timed(500, "HGET", "fx:rates", "USD");
+if (!r && r.error().category == RedisErrorCategory::Timeout) {
+    // back within 500ms, no matter what
+}
+```
+
+## What happens on timeout
+
+When a command times out, the cluster client treats the topology as
+suspect:
+
+1. The connection in use is hard-closed by the underlying `RedisClient`
+   (it never returns to the idle pool).
+2. The internal slot mapping is **invalidated** (every slot marked as
+   unassigned).
+3. The caller receives `RedisErrorCategory::Timeout`.
+
+The very next call to `command(...)` will see the empty slot mapping and
+trigger `CLUSTER SLOTS` rediscovery before going to a node — effectively
+a topology **rebuild**. This is intentional: a timeout usually means a
+node is down or a slot has migrated, so re-validating the map is cheaper
+than blindly hammering a dead node.
