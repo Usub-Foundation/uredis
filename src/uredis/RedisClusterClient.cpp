@@ -199,6 +199,7 @@ namespace usub::uredis {
 
         slot_to_node_.fill(0);
         standalone_mode_ = true;
+        topology_gen_.fetch_add(1, std::memory_order_acq_rel);
     }
 
     void RedisClusterClient::invalidate_slot_mapping_locked() noexcept {
@@ -596,6 +597,7 @@ namespace usub::uredis {
                     standalone_mode_ = false;
                     ok_mapping = true;
                     nodes_snapshot = nodes_;
+                    topology_gen_.fetch_add(1, std::memory_order_acq_rel);
                 } else {
                     if (!has_full_slot_mapping_locked()) {
                         setup_standalone_locked();
@@ -625,7 +627,8 @@ namespace usub::uredis {
         });
     }
 
-    task::Awaitable<RedisResult<void> > RedisClusterClient::rediscover_slots_serialized() {
+    task::Awaitable<RedisResult<void> > RedisClusterClient::rediscover_slots_serialized(
+        std::uint64_t observed_gen) {
         auto guard = co_await rediscover_mutex_.lock();
 
         {
@@ -633,6 +636,12 @@ namespace usub::uredis {
             if (standalone_mode_ || cfg_.force_standalone)
                 co_return RedisResult<void>{};
         }
+
+        // A concurrent caller already rebuilt the topology after the failure
+        // this caller observed — no need for another CLUSTER SLOTS round-trip.
+        if (observed_gen != UINT64_MAX &&
+            topology_gen_.load(std::memory_order_acquire) != observed_gen)
+            co_return RedisResult<void>{};
 
         co_return co_await initial_discovery();
     }
@@ -774,6 +783,12 @@ namespace usub::uredis {
             key_copy.assign(args[0].begin(), args[0].end());
 
         bool did_soft_rediscover = false;
+        // One free topology rebuild per command for Io failures: a node that
+        // died or changed address (k8s pod restart, failover promoting the
+        // replica) keeps its stale entry in the cached slot map, and without a
+        // rediscover every command routed to it fails forever. MOVED redirects
+        // don't cover this case — a dead node sends nothing at all.
+        bool did_conn_rediscover = false;
 
         // Single monotonic deadline shared across acquire + send/recv + ASK
         // hops. 0 disables (legacy behavior, only per-IO timeout applies).
@@ -816,6 +831,18 @@ namespace usub::uredis {
                     continue;
                 }
 
+                // Node unreachable (connect refused/reset — stale address after
+                // a failover or pod restart): rebuild the topology from the
+                // seeds once and retry the acquire on the fresh map.
+                if (!did_conn_rediscover &&
+                    ac.error().category == RedisErrorCategory::Io) {
+                    did_conn_rediscover = true;
+                    const auto gen = topology_gen_.load(std::memory_order_acquire);
+                    auto rr = co_await rediscover_slots_serialized(gen);
+                    if (rr)
+                        continue;
+                }
+
                 co_return std::unexpected(ac.error());
             }
 
@@ -854,6 +881,19 @@ namespace usub::uredis {
 
             if (err.category != RedisErrorCategory::ServerReply) {
                 co_await release_pooled(std::move(pc), true);
+                // Connection died mid-command: one-shot topology rebuild +
+                // retry, like the acquire path. The retry may double-send a
+                // command the dying node already applied — same at-least-once
+                // guarantee as ASK/MOVED retries, callers must stick to
+                // idempotent commands.
+                if (!did_conn_rediscover &&
+                    err.category == RedisErrorCategory::Io) {
+                    did_conn_rediscover = true;
+                    const auto gen = topology_gen_.load(std::memory_order_acquire);
+                    auto rr = co_await rediscover_slots_serialized(gen);
+                    if (rr)
+                        continue;
+                }
                 co_return std::unexpected(err);
             }
 

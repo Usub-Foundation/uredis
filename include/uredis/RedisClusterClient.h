@@ -154,6 +154,12 @@ namespace usub::uredis {
 
         sync::AsyncMutex rediscover_mutex_;
 
+        // Bumped on every successfully applied topology (full slot map or
+        // standalone fallback). Lets a failed command request a rediscover
+        // without stampeding: if the generation already changed since the
+        // failure was observed, somebody else rebuilt — just retry.
+        std::atomic<std::uint64_t> topology_gen_{0};
+
         static std::string_view extract_hash_tag(std::string_view key);
         static std::uint16_t calc_slot(std::string_view key);
         static std::optional<Redirection> parse_redirection(const std::string& msg);
@@ -185,7 +191,13 @@ namespace usub::uredis {
         task::Awaitable<RedisResult<PooledClient>> acquire_for_key(std::string_view key);
 
         task::Awaitable<RedisResult<void>> initial_discovery();
-        task::Awaitable<RedisResult<void>> rediscover_slots_serialized();
+
+        // observed_gen: topology generation the caller saw when its command
+        // failed. If the generation has already moved past it by the time the
+        // rediscover lock is taken, the topology was rebuilt concurrently and
+        // the (expensive) CLUSTER SLOTS round-trip is skipped.
+        task::Awaitable<RedisResult<void>> rediscover_slots_serialized(
+            std::uint64_t observed_gen = UINT64_MAX);
 
         // Mark every slot as unassigned. The next command will hit the
         // "slot mapping is empty" path and trigger rediscover automatically.
