@@ -23,7 +23,7 @@ include(FetchContent)
 FetchContent_Declare(
         uvent
         GIT_REPOSITORY https://github.com/Usub-development/uvent.git
-        GIT_TAG perf/sync-cancel-timer
+        GIT_TAG main
 )
 FetchContent_Declare(
         ureflect

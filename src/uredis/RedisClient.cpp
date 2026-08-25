@@ -244,7 +244,7 @@ namespace usub::uredis {
                 hard_close_socket_unlocked();
                 co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout (read deadline)"});
             }
-            socket_->update_timeout(io_to);
+            socket_->set_timeout_ms(static_cast<std::uint64_t>(io_to)); // arm if no timer (after connect timer_id==0), else refresh
 
             constexpr std::size_t max_read = 64 * 1024;
             const ssize_t rdsz = co_await socket_->async_read(buf, max_read);
@@ -284,7 +284,7 @@ namespace usub::uredis {
                 hard_close_socket_unlocked();
                 co_return std::unexpected(RedisError{RedisErrorCategory::Timeout, "command timeout (write deadline)"});
             }
-            socket_->update_timeout(io_to);
+            socket_->set_timeout_ms(static_cast<std::uint64_t>(io_to)); // arm if no timer (after connect timer_id==0), else refresh
 
             const ssize_t n = co_await socket_->async_write(frame.data() + off, frame.size() - off);
 
