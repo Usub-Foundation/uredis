@@ -45,7 +45,6 @@ namespace usub::uredis
             end - this->pos_);
 
         this->pos_ = end + 2; // skip \r\n
-        compact_if_needed();
         return line;
     }
 
@@ -63,7 +62,22 @@ namespace usub::uredis
     std::optional<RedisValue> RespParser::next()
     {
         if (!this->ensure(1)) return std::nullopt;
-        return this->parse_value();
+
+        // A reply may arrive split across several reads. The parse_* helpers advance pos_
+        // as they go, so an incomplete value must rewind to its first byte: otherwise the
+        // next call resumes in the middle of the payload and the stream is desynchronised
+        // (the caller then waits for bytes that never come, until its IO timeout).
+        // The buffer is compacted only here, after a complete value, so the rewind
+        // position stays valid.
+        const std::size_t start = this->pos_;
+        auto value = this->parse_value();
+        if (!value)
+        {
+            this->pos_ = start;
+            return std::nullopt;
+        }
+        compact_if_needed();
+        return value;
     }
 
     std::optional<RedisValue> RespParser::parse_value()
@@ -163,7 +177,6 @@ namespace usub::uredis
         if (!this->ensure(2)) return std::nullopt;
         // skip \r\n
         this->pos_ += 2;
-        compact_if_needed();
 
         RedisValue v;
         v.type  = RedisType::BulkString;
