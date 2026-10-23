@@ -200,6 +200,14 @@ if (BUILD_TESTING AND UREDIS_BUILD_TESTS)
     add_test(NAME uredis_tls_test COMMAND uredis_tls_test)
     set_tests_properties(uredis_tls_test PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Cluster client recovery test (failed start, docker pause): run through tests/cluster/run.sh,
+    # which starts / pauses a single-node Redis Cluster in Docker on the test's request.
+    add_executable(uredis_cluster_reconnect_test tests/cluster/reconnect_test.cpp)
+    target_link_libraries(uredis_cluster_reconnect_test PRIVATE uredis)
+    target_compile_definitions(uredis_cluster_reconnect_test PRIVATE DEV_STAGE=${DEV_STAGE})
+    add_test(NAME uredis_cluster_reconnect_test COMMAND uredis_cluster_reconnect_test)
+    set_tests_properties(uredis_cluster_reconnect_test PROPERTIES SKIP_RETURN_CODE 77)
+
     #    add_executable(urpc_tests ${URPC_TESTS})
     #    target_link_libraries(urpc_tests PRIVATE urpc ${GTest_LIBS})
     #    target_compile_definitions(urpc_tests PRIVATE DEV_STAGE=${DEV_STAGE})

@@ -1,5 +1,8 @@
 #include "uredis/RedisSubscriber.h"
 
+#include <algorithm>
+#include <chrono>
+
 #include <charconv>
 
 #ifdef UREDIS_LOGS
@@ -65,7 +68,9 @@ namespace usub::uredis
 #endif
 
         auto res = co_await this->socket_.async_connect(this->config_.host.c_str(),
-                                                        port_str.c_str());
+                                                        port_str.c_str(),
+                                                        std::chrono::milliseconds{
+                                                            std::max(0, this->config_.connect_timeout_ms)});
         if (res.has_value())
         {
             RedisError err{RedisErrorCategory::Io, "async_connect failed"};
