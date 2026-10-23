@@ -4,5 +4,8 @@ include(CMakeFindDependencyMacro)
 find_dependency(uvent REQUIRED)
 find_dependency(ureflect REQUIRED)
 find_dependency(ulog REQUIRED)
+if (@UREDIS_HAS_TLS@)
+    find_dependency(OpenSSL)
+endif ()
 
 include("${CMAKE_CURRENT_LIST_DIR}/urpcTargets.cmake")

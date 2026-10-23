@@ -31,7 +31,11 @@ namespace usub::uredis
         int connect_timeout_ms{3000};
         int io_timeout_ms{3000};
 
+        // The resolved master inherits base_redis (including base_redis.tls).
         RedisConfig base_redis{};
+
+        // TLS for the connections to the sentinels themselves; disabled by default.
+        RedisTlsConfig sentinel_tls{};
     };
 
     task::Awaitable<RedisResult<RedisConfig>>

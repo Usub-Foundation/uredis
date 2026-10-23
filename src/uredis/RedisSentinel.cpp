@@ -39,6 +39,7 @@ namespace usub::uredis
 
             sent_cfg.connect_timeout_ms = cfg.connect_timeout_ms;
             sent_cfg.io_timeout_ms      = cfg.io_timeout_ms;
+            sent_cfg.tls                = cfg.sentinel_tls;
 
             RedisClient sentinel_client{sent_cfg};
             auto c = co_await sentinel_client.connect();

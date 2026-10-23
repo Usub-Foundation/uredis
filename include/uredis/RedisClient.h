@@ -17,6 +17,7 @@
 #include "uvent/utils/buffer/DynamicBuffer.h"
 
 #include "uredis/RedisTypes.h"
+#include "uredis/RedisTls.h"
 #include "uredis/RespParser.h"
 
 namespace usub::uredis {
@@ -39,6 +40,9 @@ namespace usub::uredis {
         // When > 0, command() returns a Timeout error if the budget is exceeded,
         // and the underlying socket is hard-closed so callers can always exit.
         int command_timeout_ms{0};
+
+        // TLS to the server; disabled by default (plain TCP, previous behavior).
+        RedisTlsConfig tls{};
     };
 
     class RedisClient {
@@ -123,6 +127,7 @@ namespace usub::uredis {
     private:
         RedisConfig config_{};
         std::shared_ptr<net::TCPClientSocket> socket_{};
+        std::shared_ptr<detail::TlsSession> tls_{}; // set only when config_.tls.enabled
 
         bool connected_{false};
         bool closing_{false};

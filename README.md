@@ -45,6 +45,8 @@ Documentation: **https://usub-development.github.io/uredis/**
     - auto-discovery with `CLUSTER SLOTS`
     - `get_client_for_key()` → real RedisClient for the slot
 - Reflection helpers compatible with single client, Sentinel, and Cluster
+- Optional TLS (OpenSSL): server verification, SNI, custom CA, client certificates; off by
+  default — see [docs/tls.md](docs/tls.md)
 
 ---
 

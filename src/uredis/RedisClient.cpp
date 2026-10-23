@@ -75,6 +75,7 @@ namespace usub::uredis {
             sock->shutdown();
         }
         socket_.reset();
+        tls_.reset();
     }
 
     task::Awaitable<RedisResult<void> > RedisClient::connect() {
@@ -93,6 +94,7 @@ namespace usub::uredis {
             connected_ = false;
             parser_.reset();
             socket_.reset();
+            tls_.reset();
             socket_ = std::make_shared<net::TCPClientSocket>();
 
             const std::string port_str = std::to_string(config_.port);
@@ -113,6 +115,28 @@ namespace usub::uredis {
                 hard_close_socket_unlocked();
                 if (attempt == 0) continue;
                 co_return std::unexpected(RedisError{RedisErrorCategory::Io, "async_connect failed"});
+            }
+
+            if (config_.tls.enabled) {
+                auto session = detail::TlsSession::create(config_.tls, config_.host);
+                if (!session) {
+                    hard_close_socket_unlocked();
+                    // Configuration problem (bad CA file, no TLS support): retrying will not help.
+                    co_return std::unexpected(session.error());
+                }
+                tls_ = std::move(*session);
+                auto tls = tls_;
+                auto sock = socket_;
+                auto hs = co_await tls->handshake(*sock, config_.io_timeout_ms > 0 ? config_.io_timeout_ms : 5000);
+                if (!hs) {
+#ifdef UREDIS_LOGS
+                    ulog::error(R"(RedisClient::connect: TLS handshake failed this={} host="{}" port={} msg="{}")",
+                                ptr_id(this), config_.host, config_.port, hs.error().message);
+#endif
+                    hard_close_socket_unlocked();
+                    if (attempt == 0) continue;
+                    co_return std::unexpected(hs.error());
+                }
             }
 
             connected_ = true;
@@ -227,7 +251,8 @@ namespace usub::uredis {
             co_return std::unexpected(RedisError{RedisErrorCategory::Io, "socket is null"});
 
         DynamicBuffer buf;
-        buf.reserve(64 * 1024);
+        std::vector<std::uint8_t> plain; // TLS only: decrypted bytes
+        if (!tls_) buf.reserve(64 * 1024);
 
         for (;;) {
             if (auto v = parser_.next()) {
@@ -247,7 +272,17 @@ namespace usub::uredis {
             socket_->set_timeout_ms(static_cast<std::uint64_t>(io_to)); // arm if no timer (after connect timer_id==0), else refresh
 
             constexpr std::size_t max_read = 64 * 1024;
-            const ssize_t rdsz = co_await socket_->async_read(buf, max_read);
+            ssize_t rdsz = 0;
+            const bool via_tls = static_cast<bool>(tls_);
+            if (via_tls) {
+                // Locals keep the session and socket alive across the suspension.
+                auto tls = tls_;
+                auto sock = socket_;
+                if (plain.size() < max_read) plain.resize(max_read);
+                rdsz = co_await tls->read_some(*sock, plain.data(), max_read, io_to);
+            } else {
+                rdsz = co_await socket_->async_read(buf, max_read);
+            }
 
 #ifdef UREDIS_LOGS
             ulog::debug("RedisClient::read: this={} socket={} rdsz={}",
@@ -262,7 +297,8 @@ namespace usub::uredis {
                 co_return std::unexpected(RedisError{RedisErrorCategory::Io, "connection closed"});
             }
 
-            parser_.feed(reinterpret_cast<const std::uint8_t *>(buf.data()), static_cast<std::size_t>(rdsz));
+            if (via_tls) parser_.feed(plain.data(), static_cast<std::size_t>(rdsz));
+            else parser_.feed(reinterpret_cast<const std::uint8_t *>(buf.data()), static_cast<std::size_t>(rdsz));
         }
     }
 
@@ -286,7 +322,14 @@ namespace usub::uredis {
             }
             socket_->set_timeout_ms(static_cast<std::uint64_t>(io_to)); // arm if no timer (after connect timer_id==0), else refresh
 
-            const ssize_t n = co_await socket_->async_write(frame.data() + off, frame.size() - off);
+            ssize_t n = 0;
+            if (tls_) {
+                auto tls = tls_;
+                auto sock = socket_;
+                n = co_await tls->write_all(*sock, frame.data() + off, frame.size() - off, io_to);
+            } else {
+                n = co_await socket_->async_write(frame.data() + off, frame.size() - off);
+            }
 
 #ifdef UREDIS_LOGS
             ulog::debug("RedisClient::write: this={} cmd=\"{}\" n={} off={} total={}",

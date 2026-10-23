@@ -55,6 +55,22 @@ target_link_libraries(uredis
         usub::ureflect
 )
 
+# TLS (RedisTlsConfig). Built when OpenSSL is available; nothing changes for consumers that never
+# set tls.enabled. Without OpenSSL the library still builds and a TLS connection fails cleanly.
+option(UREDIS_TLS "Build TLS support (needs OpenSSL)" ON)
+set(UREDIS_HAS_TLS OFF)
+if (UREDIS_TLS)
+    find_package(OpenSSL QUIET)
+    if (OpenSSL_FOUND)
+        set(UREDIS_HAS_TLS ON)
+        target_link_libraries(uredis PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(uredis PRIVATE UREDIS_HAS_TLS)
+    else ()
+        message(WARNING "uredis: OpenSSL not found, building without TLS support")
+    endif ()
+endif ()
+message(STATUS "uredis TLS support: ${UREDIS_HAS_TLS}")
+
 if (UREDIS_LOGS)
     FetchContent_Declare(
             ulog
@@ -175,6 +191,14 @@ if (BUILD_TESTING AND UREDIS_BUILD_TESTS)
     endif ()
 
     file(GLOB_RECURSE UREDIS_TESTS CONFIGURE_DEPENDS tests/*.cpp)
+
+    # TLS integration test: run through tests/tls/run.sh (starts Redis with TLS in Docker);
+    # plain ctest without the UREDIS_TEST_* environment reports it as skipped.
+    add_executable(uredis_tls_test tests/tls/tls_test.cpp)
+    target_link_libraries(uredis_tls_test PRIVATE uredis)
+    target_compile_definitions(uredis_tls_test PRIVATE DEV_STAGE=${DEV_STAGE})
+    add_test(NAME uredis_tls_test COMMAND uredis_tls_test)
+    set_tests_properties(uredis_tls_test PROPERTIES SKIP_RETURN_CODE 77)
 
     #    add_executable(urpc_tests ${URPC_TESTS})
     #    target_link_libraries(urpc_tests PRIVATE urpc ${GTest_LIBS})
