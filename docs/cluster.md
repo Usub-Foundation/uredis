@@ -21,7 +21,11 @@ or executes the command through the node’s **connection pool**, depending on A
 * `RedisClusterClient`
 
   * `connect()` – runs initial `CLUSTER SLOTS` discovery
-    **(also prewarms pools up to `max_connections_per_node`)**
+    **(also prewarms pools up to `max_connections_per_node`)**.
+    Only success is cached: if the seeds are unreachable (Redis or DNS not ready
+    when the service starts), the next `connect()` — or the next command, which
+    connects implicitly — runs discovery again. Concurrent callers share one
+    discovery run and get its result.
   * `command(cmd, args...)` – routes the command through the per-node pooled connections
   * `get_client_for_key(key)` – returns the node’s **main client** (not from pool)
   * `get_random_client()` – same (main client), for keyless commands
@@ -53,7 +57,8 @@ Each cluster node contains:
 
 1. If queue is not empty → use connection
 2. Else if `live_count < max` → open a new pooled connection
-3. Else → coroutine briefly sleeps and retries
+3. Else → the coroutine parks until a connection is released (bounded by the
+   command deadline when `command_timeout_ms` / `command_timed` is used)
 
 This ensures excellent parallelism for workloads with high concurrency.
 
@@ -264,17 +269,24 @@ if (!r && r.error().category == RedisErrorCategory::Timeout) {
 
 ## What happens on timeout
 
-When a command times out, the cluster client treats the topology as
-suspect:
+The caller receives `RedisErrorCategory::Timeout`. What else happens depends
+on where the budget ran out:
 
-1. The connection in use is hard-closed by the underlying `RedisClient`
-   (it never returns to the idle pool).
-2. The internal slot mapping is **invalidated** (every slot marked as
-   unassigned).
-3. The caller receives `RedisErrorCategory::Timeout`.
+* **In-flight command timed out** — the connection is hard-closed by the
+  underlying `RedisClient` (a late reply would desync the stream) and leaves
+  the pool.
+* **Still waiting for a pooled connection, or for a discovery another call is
+  running** — nothing is closed; a connection the call acquired but never used
+  goes back to the pool.
 
-The very next call to `command(...)` will see the empty slot mapping and
-trigger `CLUSTER SLOTS` rediscovery before going to a node — effectively
-a topology **rebuild**. This is intentional: a timeout usually means a
-node is down or a slot has migrated, so re-validating the map is cheaper
-than blindly hammering a dead node.
+A timeout does **not** invalidate the slot mapping: a slow reply says nothing
+about slot ownership, and rebuilding the map on every timeout made all
+concurrent commands rediscover the topology one after another. Topology changes
+are picked up from:
+
+* **MOVED** — the slot is remapped and the command retried;
+* **connection (Io) errors** — a node that is gone (failover, pod restart)
+  fails the connect or the read; the command triggers one `CLUSTER SLOTS`
+  rebuild from the seeds and retries. Concurrent failures on the same topology
+  share a single rebuild; callers that fail after it finished retry on the new
+  map without another round-trip.

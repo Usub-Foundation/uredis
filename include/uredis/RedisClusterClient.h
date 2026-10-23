@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -38,11 +39,13 @@ namespace usub::uredis {
         int connect_timeout_ms{5000};
         int io_timeout_ms{5000};
 
-        // Optional total time budget for a single cluster command (across all
-        // attempts on a single node). 0 = disabled. On expiration the call
-        // returns RedisErrorCategory::Timeout, the underlying connection is
-        // hard-closed (so it leaves the pool) and the slot mapping is
-        // invalidated so the next command rediscovers the cluster topology.
+        // Optional total time budget for a single cluster command (discovery
+        // wait, pool acquisition, IO and MOVED/ASK hops). 0 = disabled. On
+        // expiration the call returns RedisErrorCategory::Timeout. Only a
+        // connection whose in-flight command timed out is hard-closed; a
+        // connection the call never used goes back to the pool. A timeout does
+        // not touch the slot mapping: topology is rebuilt on MOVED and on
+        // connection (Io) errors, single-flighted across concurrent callers.
         int command_timeout_ms{0};
 
         int max_redirections{5};
@@ -60,6 +63,10 @@ namespace usub::uredis {
     public:
         explicit RedisClusterClient(RedisClusterConfig cfg);
 
+        // Runs the initial CLUSTER SLOTS discovery. Only a success is cached:
+        // after a failure (seeds down, DNS not ready) the next connect() — or
+        // the next command, which calls it implicitly — tries again. Concurrent
+        // callers share one discovery run and all get its result.
         task::Awaitable<RedisResult<void>> connect();
 
         task::Awaitable<RedisResult<RedisValue>> command(
@@ -79,8 +86,7 @@ namespace usub::uredis {
         }
 
         // Per-call timeout variant: total budget across all redirection
-        // attempts. On expiration: Timeout error + slot mapping invalidated
-        // (next command will trigger a full rediscover).
+        // attempts. On expiration: Timeout error (see command_timeout_ms).
         task::Awaitable<RedisResult<RedisValue>> command_timed(
             std::string_view cmd,
             std::span<const std::string_view> args,
@@ -123,9 +129,33 @@ namespace usub::uredis {
                 : cfg(std::move(cfg_))
                 , idle(max_pool) {}
 
+            // idle_sem is only a wake-up hint for coroutines parked in
+            // acquire_from_node, so it is released only while someone waits —
+            // releasing on every return to the pool (fast-path acquires never
+            // take a permit) piled up permits without bound: parked acquirers
+            // then spun through them without suspending, and the int32 counter
+            // eventually overflowed. seq_cst here pairs with the waiter's
+            // waiters++ / re-check: either the waiter sees the freed
+            // connection (slot) or we see the waiter.
             void notify_waiters_if_any() noexcept {
-                if (waiters.load(std::memory_order_relaxed) > 0)
+                if (waiters.load(std::memory_order_seq_cst) > 0)
                     idle_sem.release();
+            }
+
+            // A healthy connection goes back to the idle queue.
+            bool push_idle(std::shared_ptr<RedisClient> c) noexcept {
+                if (!idle.try_enqueue(std::move(c)))
+                    return false;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                notify_waiters_if_any();
+                return true;
+            }
+
+            // A pooled connection left the pool for good (closed or never
+            // opened): free its slot and wake a waiter so it can open a new one.
+            void drop_live() noexcept {
+                live_count.fetch_sub(1, std::memory_order_seq_cst);
+                notify_waiters_if_any();
             }
         };
 
@@ -143,6 +173,16 @@ namespace usub::uredis {
             std::uint16_t port{0};
         };
 
+        // One discovery run (initial connect or topology rebuild), shared by
+        // every caller that arrives while it is in flight.
+        struct DiscoveryFlight {
+            sync::AsyncEvent done{sync::Reset::Manual, false};
+            RedisResult<void> result{};
+            // The leader was cancelled mid-run: its error says nothing about the
+            // cluster, so joiners start (or join) a fresh run instead.
+            bool aborted{false};
+        };
+
         RedisClusterConfig cfg_;
 
         std::vector<std::shared_ptr<Node>> nodes_;
@@ -151,18 +191,17 @@ namespace usub::uredis {
 
         sync::AsyncMutex mutex_;
 
-        sync::AsyncMutex init_mutex_;
-        sync::AsyncEvent init_event_{sync::Reset::Manual, false};
-        bool init_started_{false};
-        bool init_finished_{false};
-        std::optional<RedisResult<void>> init_result_;
-
-        sync::AsyncMutex rediscover_mutex_;
+        // Guards discovery_flight_ and writes of init_ok_. Never held across a
+        // co_await (plain critical sections of a few loads/stores).
+        std::mutex discovery_mu_;
+        std::shared_ptr<DiscoveryFlight> discovery_flight_;
+        // Set once any discovery succeeded; failures are never cached.
+        std::atomic<bool> init_ok_{false};
 
         // Bumped on every successfully applied topology (full slot map or
-        // standalone fallback). Lets a failed command request a rediscover
-        // without stampeding: if the generation already changed since the
-        // failure was observed, somebody else rebuilt — just retry.
+        // standalone fallback). A caller records it before routing a command;
+        // when the command fails and asks for a rebuild, a moved generation
+        // means somebody already rebuilt — it just retries on the new map.
         std::atomic<std::uint64_t> topology_gen_{0};
 
         static std::string_view extract_hash_tag(std::string_view key);
@@ -183,48 +222,49 @@ namespace usub::uredis {
 
         static task::Awaitable<void> warm_pool_fill_to_max(
             const RedisClusterConfig& cfg,
-            const std::shared_ptr<Node>& node);
+            std::shared_ptr<Node> node);
 
+        // deadline_ms: monotonic ms, 0 = none. Bounds the wait for a free
+        // pooled connection (Timeout error when it passes).
         task::Awaitable<RedisResult<PooledClient>>
-        acquire_from_node(const std::shared_ptr<Node>& node);
+        acquire_from_node(std::shared_ptr<Node> node, std::int64_t deadline_ms);
 
-        task::Awaitable<void>
-        release_pooled(PooledClient&& pc, bool faulty);
+        // faulty = the connection had an IO failure or a timed-out in-flight
+        // command; anything else goes back to the idle queue.
+        static void release_pooled(PooledClient&& pc, bool faulty) noexcept;
 
-        task::Awaitable<RedisResult<PooledClient>> acquire_for_slot(int slot);
-        task::Awaitable<RedisResult<PooledClient>> acquire_for_any();
-        task::Awaitable<RedisResult<PooledClient>> acquire_for_key(std::string_view key);
+        // Callers must have connected (init_ok_) before routing.
+        task::Awaitable<RedisResult<PooledClient>> acquire_for_slot(int slot, std::int64_t deadline_ms);
+        task::Awaitable<RedisResult<PooledClient>> acquire_for_any(std::int64_t deadline_ms);
+        task::Awaitable<RedisResult<PooledClient>> acquire_for_key(std::string_view key, std::int64_t deadline_ms);
 
         task::Awaitable<RedisResult<void>> initial_discovery();
 
-        // observed_gen: topology generation the caller saw when its command
-        // failed. If the generation has already moved past it by the time the
-        // rediscover lock is taken, the topology was rebuilt concurrently and
-        // the (expensive) CLUSTER SLOTS round-trip is skipped.
+        // Single-flight discovery. initial: done once init_ok_ is set;
+        // otherwise done once topology_gen_ != observed_gen. Callers arriving
+        // while a run is in flight wait for it (bounded by deadline_ms when
+        // > 0) and take its result instead of starting their own.
+        task::Awaitable<RedisResult<void>> run_discovery(
+            bool initial, std::uint64_t observed_gen, std::int64_t deadline_ms);
+
+        // observed_gen: topology generation the caller read before routing the
+        // command that failed. If it has moved since, the topology was rebuilt
+        // concurrently and the CLUSTER SLOTS round-trip is skipped.
         task::Awaitable<RedisResult<void>> rediscover_slots_serialized(
-            std::uint64_t observed_gen = UINT64_MAX);
-
-        // Mark every slot as unassigned. The next command will hit the
-        // "slot mapping is empty" path and trigger rediscover automatically.
-        // No-op in standalone mode.
-        void invalidate_slot_mapping_locked() noexcept;
-
-        // Coroutine wrapper that takes the mutex and invalidates the mapping.
-        // Used after a Timeout so the next command rebuilds the topology.
-        task::Awaitable<void> force_rebuild_on_timeout();
+            std::uint64_t observed_gen, std::int64_t deadline_ms);
 
         task::Awaitable<RedisResult<RedisValue>> command_impl(
             std::string_view cmd,
             std::span<const std::string_view> args,
             int timeout_ms);
 
-        task::Awaitable<void> apply_moved(const Redirection& r);
+        task::Awaitable<void> apply_moved(Redirection r);
 
         task::Awaitable<RedisResult<RedisValue>> execute_ask(
-            const Redirection& r,
+            Redirection r,
             std::string_view cmd,
             std::span<const std::string_view> args,
-            int per_call_timeout_ms);
+            std::int64_t deadline_ms);
     };
 } // namespace usub::uredis
 

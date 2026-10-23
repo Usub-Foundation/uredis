@@ -1,5 +1,7 @@
 #include "uredis/RedisClient.h"
 
+#include <algorithm>
+
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -106,7 +108,11 @@ namespace usub::uredis {
                 config_.username.has_value(), config_.password.has_value());
 #endif
 
-            auto rc = co_await socket_->async_connect(config_.host.c_str(), port_str.c_str());
+            // Bounded: a node that silently drops packets must not hold the caller for the
+            // kernel's TCP timeout (~2 min). <= 0 keeps the old unbounded behaviour.
+            auto rc = co_await socket_->async_connect(
+                config_.host.c_str(), port_str.c_str(),
+                std::chrono::milliseconds{std::max(0, config_.connect_timeout_ms)});
             if (rc.has_value()) {
 #ifdef UREDIS_LOGS
                 ulog::error("RedisClient::connect: async_connect failed this={} host=\"{}\" port={} attempt={}",

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <chrono>
+#include <exception>
 #include <string>
 
 #ifdef UREDIS_LOGS
@@ -10,6 +12,21 @@
 #endif
 
 namespace usub::uredis {
+    static inline std::int64_t cluster_now_ms() noexcept {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+
+    // The calling task was cancelled (a lock/semaphore/event wait came back
+    // empty). Says nothing about the cluster: never cached, never shared.
+    static RedisError cancelled_error() {
+        return RedisError{RedisErrorCategory::Io, "RedisClusterClient: cancelled"};
+    }
+
+    static RedisError command_timeout_error(const char *where) {
+        return RedisError{RedisErrorCategory::Timeout, std::string("RedisClusterClient: command timeout") + where};
+    }
+
     static bool is_cluster_disabled_error(const RedisError &e) {
         if (e.category != RedisErrorCategory::ServerReply)
             return false;
@@ -204,17 +221,6 @@ namespace usub::uredis {
         topology_gen_.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    void RedisClusterClient::invalidate_slot_mapping_locked() noexcept {
-        if (standalone_mode_) return;
-        slot_to_node_.fill(-1);
-    }
-
-    task::Awaitable<void> RedisClusterClient::force_rebuild_on_timeout() {
-        auto g = co_await mutex_.lock();
-        invalidate_slot_mapping_locked();
-        co_return;
-    }
-
     bool RedisClusterClient::has_full_slot_mapping_locked() const noexcept {
         return std::all_of(
             slot_to_node_.begin(), slot_to_node_.end(),
@@ -248,7 +254,7 @@ namespace usub::uredis {
 
     task::Awaitable<void> RedisClusterClient::warm_pool_fill_to_max(
         const RedisClusterConfig &cfg,
-        const std::shared_ptr<Node> &node) {
+        std::shared_ptr<Node> node) {
         for (;;) {
             auto cur = node->live_count.load(std::memory_order_relaxed);
             if (cur >= cfg.max_connections_per_node)
@@ -262,23 +268,19 @@ namespace usub::uredis {
             auto cli = std::make_shared<RedisClient>(node->cfg);
             auto c = co_await cli->connect();
             if (!c) {
-                node->live_count.fetch_sub(1, std::memory_order_relaxed);
-                node->notify_waiters_if_any();
+                node->drop_live();
                 co_return;
             }
 
-            if (!node->idle.try_enqueue(cli)) {
-                node->live_count.fetch_sub(1, std::memory_order_relaxed);
-                node->notify_waiters_if_any();
+            if (!node->push_idle(std::move(cli))) {
+                node->drop_live();
                 co_return;
             }
-
-            node->idle_sem.release();
         }
     }
 
     task::Awaitable<RedisResult<RedisClusterClient::PooledClient> >
-    RedisClusterClient::acquire_from_node(const std::shared_ptr<Node> &node) {
+    RedisClusterClient::acquire_from_node(std::shared_ptr<Node> node, std::int64_t deadline_ms) {
         std::shared_ptr<RedisClient> client;
 
         for (;;) {
@@ -286,15 +288,15 @@ namespace usub::uredis {
                 if (!client) continue;
 
                 if (!client->connected() || !client->is_idle()) {
-                    node->live_count.fetch_sub(1, std::memory_order_relaxed);
-                    node->notify_waiters_if_any();
+                    client.reset();
+                    node->drop_live();
                     continue;
                 }
 
                 co_return PooledClient{node, std::move(client)};
             }
 
-            auto cur = node->live_count.load(std::memory_order_relaxed);
+            auto cur = node->live_count.load(std::memory_order_seq_cst);
             if (cur < cfg_.max_connections_per_node) {
                 if (node->live_count.compare_exchange_strong(
                     cur, cur + 1,
@@ -302,8 +304,7 @@ namespace usub::uredis {
                     auto cli = std::make_shared<RedisClient>(node->cfg);
                     auto c = co_await cli->connect();
                     if (!c) {
-                        node->live_count.fetch_sub(1, std::memory_order_relaxed);
-                        node->notify_waiters_if_any();
+                        node->drop_live();
                         co_return std::unexpected(c.error());
                     }
                     co_return PooledClient{node, std::move(cli)};
@@ -311,40 +312,78 @@ namespace usub::uredis {
                 continue;
             }
 
-            node->waiters.fetch_add(1, std::memory_order_relaxed);
-            co_await node->idle_sem.acquire();
+            // Pool exhausted. Announce ourselves, then look again: a release
+            // that ran before the announcement saw no waiter and woke nobody.
+            node->waiters.fetch_add(1, std::memory_order_seq_cst);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (node->idle.try_dequeue(client)) {
+                node->waiters.fetch_sub(1, std::memory_order_relaxed);
+                if (!client) continue;
+                if (!client->connected() || !client->is_idle()) {
+                    client.reset();
+                    node->drop_live();
+                    continue;
+                }
+                co_return PooledClient{node, std::move(client)};
+            }
+            if (node->live_count.load(std::memory_order_seq_cst) < cfg_.max_connections_per_node) {
+                node->waiters.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            bool woke = false;
+            bool timed_out = false;
+            if (deadline_ms > 0) {
+                const std::int64_t rem = deadline_ms - cluster_now_ms();
+                if (rem <= 0) {
+                    timed_out = true;
+                } else {
+                    auto r = co_await sync::select(
+                        node->idle_sem.acquire_op(),
+                        sync::sleep_op(std::chrono::milliseconds{rem}));
+                    if (!r.cancelled()) {
+                        if (r.index == 0)
+                            woke = true;
+                        else
+                            timed_out = true;
+                    }
+                }
+            } else {
+                woke = co_await node->idle_sem.acquire();
+            }
             node->waiters.fetch_sub(1, std::memory_order_relaxed);
+
+            // Nothing was taken from the pool: no connection to give back.
+            if (timed_out)
+                co_return std::unexpected(command_timeout_error(" (waiting for a pooled connection)"));
+            if (!woke)
+                co_return std::unexpected(cancelled_error());
         }
     }
 
-    task::Awaitable<void>
-    RedisClusterClient::release_pooled(PooledClient &&pc, bool faulty) {
+    void RedisClusterClient::release_pooled(PooledClient &&pc, bool faulty) noexcept {
         auto node = std::move(pc.node);
         auto client = std::move(pc.client);
 
         if (!node || !client)
-            co_return;
+            return;
 
+        // Faulty = IO failure or a timed-out in-flight command (RedisClient has
+        // already hard-closed it); a dead or half-closed socket goes too.
+        // Everything else — including a connection the caller acquired but
+        // never used because its deadline ran out — is reused.
         if (faulty || !client->connected() || !client->is_idle()) {
-            node->live_count.fetch_sub(1, std::memory_order_relaxed);
-            node->notify_waiters_if_any();
-            co_return;
+            client.reset();
+            node->drop_live();
+            return;
         }
 
-        if (!node->idle.try_enqueue(client)) {
-            node->live_count.fetch_sub(1, std::memory_order_relaxed);
-            node->notify_waiters_if_any();
-            co_return;
-        }
-
-        node->idle_sem.release();
+        if (!node->push_idle(std::move(client)))
+            node->drop_live();
     }
 
     task::Awaitable<RedisResult<RedisClusterClient::PooledClient> >
-    RedisClusterClient::acquire_for_slot(int slot) {
-        auto init = co_await connect();
-        if (!init) co_return std::unexpected(init.error());
-
+    RedisClusterClient::acquire_for_slot(int slot, std::int64_t deadline_ms) {
         if (slot < 0 || slot >= 16384)
             co_return std::unexpected(
                 RedisError{RedisErrorCategory::Protocol, "RedisClusterClient: invalid slot"});
@@ -352,78 +391,148 @@ namespace usub::uredis {
         std::shared_ptr<Node> node;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             auto idx = node_index_for_slot_locked(slot);
             if (!idx) co_return std::unexpected(idx.error());
             node = nodes_[static_cast<std::size_t>(*idx)];
         }
 
-        co_return co_await acquire_from_node(node);
+        co_return co_await acquire_from_node(std::move(node), deadline_ms);
     }
 
     task::Awaitable<RedisResult<RedisClusterClient::PooledClient> >
-    RedisClusterClient::acquire_for_any() {
-        auto init = co_await connect();
-        if (!init) co_return std::unexpected(init.error());
-
+    RedisClusterClient::acquire_for_any(std::int64_t deadline_ms) {
         std::shared_ptr<Node> node;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             if (nodes_.empty())
                 co_return std::unexpected(
                     RedisError{RedisErrorCategory::Protocol, "RedisClusterClient: no nodes"});
             node = nodes_.front();
         }
 
-        co_return co_await acquire_from_node(node);
+        co_return co_await acquire_from_node(std::move(node), deadline_ms);
     }
 
     task::Awaitable<RedisResult<RedisClusterClient::PooledClient> >
-    RedisClusterClient::acquire_for_key(std::string_view key) {
-        auto init = co_await connect();
-        if (!init) co_return std::unexpected(init.error());
-
+    RedisClusterClient::acquire_for_key(std::string_view key, std::int64_t deadline_ms) {
         if (key.empty())
-            co_return co_await acquire_for_any();
+            co_return co_await acquire_for_any(deadline_ms);
 
         std::shared_ptr<Node> node;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             auto idx = node_index_for_key_locked(key);
             if (!idx) co_return std::unexpected(idx.error());
             node = nodes_[static_cast<std::size_t>(*idx)];
         }
 
-        co_return co_await acquire_from_node(node);
+        co_return co_await acquire_from_node(std::move(node), deadline_ms);
     }
 
     task::Awaitable<RedisResult<void> > RedisClusterClient::connect() {
-        bool we_init = false;
+        if (init_ok_.load(std::memory_order_acquire))
+            co_return RedisResult<void>{};
+        co_return co_await run_discovery(true, 0, 0);
+    }
 
-        {
-            auto g = co_await init_mutex_.lock();
-            if (init_finished_)
-                co_return *init_result_;
-            if (!init_started_) {
-                init_started_ = true;
-                we_init = true;
+    task::Awaitable<RedisResult<void> > RedisClusterClient::run_discovery(
+        bool initial, std::uint64_t observed_gen, std::int64_t deadline_ms) {
+        for (;;) {
+            // A cancelled caller must not lead a run: its failure would be
+            // handed to every joiner.
+            if (usub::uvent::system::this_coroutine::cancel_requested())
+                co_return std::unexpected(cancelled_error());
+
+            std::shared_ptr<DiscoveryFlight> flight;
+            bool leader = false;
+            bool satisfied = false;
+            {
+                std::lock_guard<std::mutex> lk(discovery_mu_);
+                if (initial)
+                    satisfied = init_ok_.load(std::memory_order_acquire);
+                else
+                    satisfied = topology_gen_.load(std::memory_order_acquire) != observed_gen;
+
+                if (!satisfied) {
+                    if (discovery_flight_) {
+                        flight = discovery_flight_;
+                    } else {
+                        flight = std::make_shared<DiscoveryFlight>();
+                        discovery_flight_ = flight;
+                        leader = true;
+                    }
+                }
             }
+            if (satisfied)
+                co_return RedisResult<void>{};
+
+            if (leader) {
+                RedisResult<void> res = std::unexpected(
+                    RedisError{RedisErrorCategory::Io, "RedisClusterClient: discovery failed"});
+                try {
+                    res = co_await initial_discovery();
+                } catch (const std::exception &ex) {
+                    res = std::unexpected(RedisError{
+                        RedisErrorCategory::Io, std::string("RedisClusterClient: discovery threw: ") + ex.what()
+                    });
+                } catch (...) {
+                    res = std::unexpected(RedisError{
+                        RedisErrorCategory::Io, "RedisClusterClient: discovery threw"
+                    });
+                }
+                const bool aborted = !res && usub::uvent::system::this_coroutine::cancel_requested();
+
+                {
+                    std::lock_guard<std::mutex> lk(discovery_mu_);
+                    // Only success is remembered; after a failure the next
+                    // caller starts a new run.
+                    if (res)
+                        init_ok_.store(true, std::memory_order_release);
+                    flight->result = res;
+                    flight->aborted = aborted;
+                    discovery_flight_.reset();
+                }
+                flight->done.set();
+                co_return res;
+            }
+
+            bool woke = false;
+            bool timed_out = false;
+            if (flight->done.is_set()) {
+                woke = true;
+            } else if (deadline_ms > 0) {
+                const std::int64_t rem = deadline_ms - cluster_now_ms();
+                if (rem <= 0) {
+                    timed_out = true;
+                } else {
+                    auto r = co_await sync::select(
+                        flight->done.wait_op(),
+                        sync::sleep_op(std::chrono::milliseconds{rem}));
+                    if (!r.cancelled()) {
+                        if (r.index == 0)
+                            woke = true;
+                        else
+                            timed_out = true;
+                    }
+                }
+            } else {
+                woke = co_await flight->done.wait();
+            }
+
+            if (timed_out)
+                co_return std::unexpected(command_timeout_error(" (waiting for cluster discovery)"));
+            if (!woke)
+                co_return std::unexpected(cancelled_error());
+            if (flight->aborted)
+                continue;
+            co_return flight->result;
         }
-
-        if (!we_init) {
-            co_await init_event_.wait();
-            co_return *init_result_;
-        }
-
-        auto res = co_await initial_discovery();
-
-        {
-            auto g = co_await init_mutex_.lock();
-            init_result_ = res;
-            init_finished_ = true;
-            init_event_.set();
-        }
-
-        co_return res;
     }
 
     task::Awaitable<RedisResult<void> > RedisClusterClient::initial_discovery() {
@@ -435,6 +544,8 @@ namespace usub::uredis {
             std::vector<std::shared_ptr<Node> > snap;
             {
                 auto g = co_await mutex_.lock();
+                if (!g.owns_lock())
+                    co_return std::unexpected(cancelled_error());
                 setup_standalone_locked();
                 snap = nodes_;
             }
@@ -445,6 +556,8 @@ namespace usub::uredis {
 
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             if (standalone_mode_) {
                 auto snap = nodes_;
                 g.unlock();
@@ -479,6 +592,8 @@ namespace usub::uredis {
                     std::vector<std::shared_ptr<Node> > snap;
                     {
                         auto g = co_await mutex_.lock();
+                        if (!g.owns_lock())
+                            co_return std::unexpected(cancelled_error());
                         setup_standalone_locked();
                         snap = nodes_;
                     }
@@ -504,6 +619,8 @@ namespace usub::uredis {
                 std::vector<std::shared_ptr<Node> > snap;
                 {
                     auto g = co_await mutex_.lock();
+                    if (!g.owns_lock())
+                        co_return std::unexpected(cancelled_error());
                     setup_standalone_locked();
                     snap = nodes_;
                 }
@@ -541,6 +658,8 @@ namespace usub::uredis {
 
             {
                 auto guard = co_await mutex_.lock();
+                if (!guard.owns_lock())
+                    co_return std::unexpected(cancelled_error());
 
                 auto ensure = [&](const RedisValue &node_val) -> std::optional<int> {
                     if (!node_val.is_array()) return std::nullopt;
@@ -631,66 +750,96 @@ namespace usub::uredis {
     }
 
     task::Awaitable<RedisResult<void> > RedisClusterClient::rediscover_slots_serialized(
-        std::uint64_t observed_gen) {
-        auto guard = co_await rediscover_mutex_.lock();
-
+        std::uint64_t observed_gen, std::int64_t deadline_ms) {
+        if (cfg_.force_standalone)
+            co_return RedisResult<void>{};
         {
             auto g = co_await mutex_.lock();
-            if (standalone_mode_ || cfg_.force_standalone)
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
+            if (standalone_mode_)
                 co_return RedisResult<void>{};
         }
 
-        // A concurrent caller already rebuilt the topology after the failure
-        // this caller observed — no need for another CLUSTER SLOTS round-trip.
-        if (observed_gen != UINT64_MAX &&
-            topology_gen_.load(std::memory_order_acquire) != observed_gen)
-            co_return RedisResult<void>{};
-
-        co_return co_await initial_discovery();
+        // Concurrent callers that saw the same generation share one CLUSTER
+        // SLOTS run; callers arriving after it succeeded see a newer
+        // generation and just retry on the rebuilt map.
+        co_return co_await run_discovery(false, observed_gen, deadline_ms);
     }
 
-    task::Awaitable<void> RedisClusterClient::apply_moved(const Redirection &r) {
+    task::Awaitable<void> RedisClusterClient::apply_moved(Redirection r) {
         if (r.slot < 0 || r.slot >= 16384)
             co_return;
 
         auto g = co_await mutex_.lock();
+        if (!g.owns_lock())
+            co_return;
         int idx = ensure_node_locked(r.host, r.port);
         slot_to_node_[static_cast<std::size_t>(r.slot)] = idx;
     }
 
     task::Awaitable<RedisResult<RedisValue> >
     RedisClusterClient::execute_ask(
-        const Redirection &r,
+        Redirection r,
         std::string_view cmd,
         std::span<const std::string_view> args,
-        int per_call_timeout_ms) {
+        std::int64_t deadline_ms) {
         std::shared_ptr<Node> node;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             int idx = ensure_node_locked(r.host, r.port);
             node = nodes_[static_cast<std::size_t>(idx)];
         }
 
-        auto pc_res = co_await acquire_from_node(node);
+        auto pc_res = co_await acquire_from_node(std::move(node), deadline_ms);
         if (!pc_res)
             co_return std::unexpected(pc_res.error());
 
         auto pc = std::move(*pc_res);
 
+        // Budget left for one call on the acquired connection: -1 = no
+        // deadline, 0 = expired before anything was sent.
+        auto budget = [deadline_ms]() -> int {
+            if (deadline_ms <= 0) return -1;
+            const auto rem = deadline_ms - cluster_now_ms();
+            return rem <= 0 ? 0 : static_cast<int>(rem);
+        };
+
+        int to = budget();
+        if (to == 0) {
+            release_pooled(std::move(pc), false); // never used
+            co_return std::unexpected(command_timeout_error(""));
+        }
+
         std::span<const std::string_view> no_args;
-        auto ask_resp = (per_call_timeout_ms > 0)
-                            ? co_await pc.client->command_timed("ASKING", no_args, per_call_timeout_ms)
-                            : co_await pc.client->command("ASKING", no_args);
+        RedisResult<RedisValue> ask_resp;
+        if (to > 0)
+            ask_resp = co_await pc.client->command_timed("ASKING", no_args, to);
+        else
+            ask_resp = co_await pc.client->command("ASKING", no_args);
         if (!ask_resp) {
-            co_await release_pooled(std::move(pc), true);
+            const bool faulty = ask_resp.error().category != RedisErrorCategory::ServerReply;
+            release_pooled(std::move(pc), faulty);
             co_return std::unexpected(ask_resp.error());
         }
 
-        auto resp = (per_call_timeout_ms > 0)
-                        ? co_await pc.client->command_timed(cmd, args, per_call_timeout_ms)
-                        : co_await pc.client->command(cmd, args);
-        bool faulty = !resp && resp.error().category != RedisErrorCategory::ServerReply;
-        co_await release_pooled(std::move(pc), faulty);
+        to = budget();
+        if (to == 0) {
+            // ASKING was answered, nothing is in flight: the connection is
+            // fine (the ASKING flag only applies to the next command).
+            release_pooled(std::move(pc), false);
+            co_return std::unexpected(command_timeout_error(""));
+        }
+
+        RedisResult<RedisValue> resp;
+        if (to > 0)
+            resp = co_await pc.client->command_timed(cmd, args, to);
+        else
+            resp = co_await pc.client->command(cmd, args);
+        const bool faulty = !resp && resp.error().category != RedisErrorCategory::ServerReply;
+        release_pooled(std::move(pc), faulty);
 
         co_return resp;
     }
@@ -707,6 +856,8 @@ namespace usub::uredis {
         std::uint16_t port;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             auto idx = node_index_for_key_locked(key);
             if (!idx) co_return std::unexpected(idx.error());
             host = nodes_[static_cast<std::size_t>(*idx)]->cfg.host;
@@ -725,6 +876,8 @@ namespace usub::uredis {
         std::uint16_t port;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             if (nodes_.empty())
                 co_return std::unexpected(
                     RedisError{RedisErrorCategory::Protocol, "RedisClusterClient: no nodes"});
@@ -744,6 +897,8 @@ namespace usub::uredis {
         std::uint16_t port;
         {
             auto g = co_await mutex_.lock();
+            if (!g.owns_lock())
+                co_return std::unexpected(cancelled_error());
             auto idx = node_index_for_slot_locked(slot);
             if (!idx) co_return std::unexpected(idx.error());
             host = nodes_[static_cast<std::size_t>(*idx)]->cfg.host;
@@ -751,11 +906,6 @@ namespace usub::uredis {
         }
 
         co_return co_await connect_to_node(host, port);
-    }
-
-    static inline std::int64_t cluster_now_ms() noexcept {
-        using namespace std::chrono;
-        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
     task::Awaitable<RedisResult<RedisValue> >
@@ -778,8 +928,19 @@ namespace usub::uredis {
         std::string_view cmd,
         std::span<const std::string_view> args,
         int timeout_ms) {
-        auto init = co_await connect();
-        if (!init) co_return std::unexpected(init.error());
+        // Single monotonic deadline shared across discovery wait, acquire,
+        // send/recv and ASK/MOVED hops. 0 disables it (only per-IO timeout
+        // applies).
+        const std::int64_t deadline_ms = (timeout_ms > 0)
+                                             ? (cluster_now_ms() + static_cast<std::int64_t>(timeout_ms))
+                                             : 0;
+
+        // Not connected yet, or every discovery so far failed (seeds were
+        // down at startup): run one now — or join the one in flight.
+        if (!init_ok_.load(std::memory_order_acquire)) {
+            auto init = co_await run_discovery(true, 0, deadline_ms);
+            if (!init) co_return std::unexpected(init.error());
+        }
 
         std::string key_copy;
         if (!args.empty())
@@ -793,14 +954,7 @@ namespace usub::uredis {
         // don't cover this case — a dead node sends nothing at all.
         bool did_conn_rediscover = false;
 
-        // Single monotonic deadline shared across acquire + send/recv + ASK
-        // hops. 0 disables (legacy behavior, only per-IO timeout applies).
-        const std::int64_t deadline_ms = (timeout_ms > 0)
-                                             ? (cluster_now_ms() + static_cast<std::int64_t>(timeout_ms))
-                                             : 0;
-
-        // Lambda: budget left for a single attempt, returns -1 if no deadline,
-        // 0 if expired (caller must time out).
+        // Budget left for one attempt: -1 = no deadline, 0 = expired.
         auto remaining = [deadline_ms]() -> int {
             if (deadline_ms <= 0) return -1;
             const auto rem = deadline_ms - cluster_now_ms();
@@ -808,27 +962,38 @@ namespace usub::uredis {
         };
 
         for (int attempt = 0; attempt < cfg_.max_redirections; ++attempt) {
-            // Hard check the user-visible deadline before doing more work.
-            if (deadline_ms > 0 && remaining() == 0) {
-                co_await force_rebuild_on_timeout();
-                co_return std::unexpected(
-                    RedisError{RedisErrorCategory::Timeout, "RedisClusterClient: command timeout"});
-            }
+            if (deadline_ms > 0 && remaining() == 0)
+                co_return std::unexpected(command_timeout_error(""));
 
             PooledClient pc;
+            // Topology generation this attempt is routed with. A rebuild
+            // request carries it, so callers that failed on the same map share
+            // one CLUSTER SLOTS run and callers that failed on an already
+            // replaced map just retry.
+            std::uint64_t routed_gen = 0;
             for (;;) {
-                auto ac = args.empty()
-                              ? co_await acquire_for_any()
-                              : co_await acquire_for_key(key_copy);
+                routed_gen = topology_gen_.load(std::memory_order_acquire);
+                RedisResult<PooledClient> ac;
+                if (args.empty())
+                    ac = co_await acquire_for_any(deadline_ms);
+                else
+                    ac = co_await acquire_for_key(key_copy, deadline_ms);
 
                 if (ac) {
                     pc = std::move(*ac);
                     break;
                 }
 
-                if (!did_soft_rediscover && is_slot_mapping_empty_error(ac.error())) {
+                RedisError aerr = ac.error();
+
+                // Deadline passed while waiting for a free connection: nothing
+                // was taken, nothing to close, the topology is not suspect.
+                if (aerr.category == RedisErrorCategory::Timeout)
+                    co_return std::unexpected(std::move(aerr));
+
+                if (!did_soft_rediscover && is_slot_mapping_empty_error(aerr)) {
                     did_soft_rediscover = true;
-                    auto rr = co_await rediscover_slots_serialized();
+                    auto rr = co_await rediscover_slots_serialized(routed_gen, deadline_ms);
                     if (!rr)
                         co_return std::unexpected(rr.error());
                     continue;
@@ -837,53 +1002,57 @@ namespace usub::uredis {
                 // Node unreachable (connect refused/reset — stale address after
                 // a failover or pod restart): rebuild the topology from the
                 // seeds once and retry the acquire on the fresh map.
-                if (!did_conn_rediscover &&
-                    ac.error().category == RedisErrorCategory::Io) {
+                if (!did_conn_rediscover && aerr.category == RedisErrorCategory::Io) {
                     did_conn_rediscover = true;
-                    const auto gen = topology_gen_.load(std::memory_order_acquire);
-                    auto rr = co_await rediscover_slots_serialized(gen);
+                    auto rr = co_await rediscover_slots_serialized(routed_gen, deadline_ms);
                     if (rr)
                         continue;
                 }
 
-                co_return std::unexpected(ac.error());
+                co_return std::unexpected(std::move(aerr));
             }
 
-            // Compute per-call timeout for the underlying RedisClient. If we
-            // have no overall deadline, pass 0 (let the client use its own
-            // configured command_timeout_ms, or none if also 0).
+            // Per-call timeout for the underlying RedisClient. Without an
+            // overall deadline pass 0 (the client uses its own
+            // command_timeout_ms, or none).
             int per_call_to = 0;
             if (deadline_ms > 0) {
                 per_call_to = remaining();
                 if (per_call_to <= 0) {
-                    co_await release_pooled(std::move(pc), true);
-                    co_await force_rebuild_on_timeout();
-                    co_return std::unexpected(
-                        RedisError{RedisErrorCategory::Timeout, "RedisClusterClient: command timeout"});
+                    // The budget ran out while waiting for the connection or a
+                    // rediscovery. Nothing was sent on it — it is healthy and
+                    // goes back to the pool.
+                    release_pooled(std::move(pc), false);
+                    co_return std::unexpected(command_timeout_error(""));
                 }
             }
 
-            auto resp = (per_call_to > 0)
-                            ? co_await pc.client->command_timed(cmd, args, per_call_to)
-                            : co_await pc.client->command(cmd, args);
+            RedisResult<RedisValue> resp;
+            if (per_call_to > 0)
+                resp = co_await pc.client->command_timed(cmd, args, per_call_to);
+            else
+                resp = co_await pc.client->command(cmd, args);
             if (resp) {
-                co_await release_pooled(std::move(pc), false);
+                release_pooled(std::move(pc), false);
                 co_return resp;
             }
 
             auto err = resp.error();
 
-            // Timeout: connection is hard-closed by RedisClient already; mark
-            // as faulty so it doesn't return to the idle pool, then force a
-            // topology rebuild because the cluster may have moved/failed over.
+            // The in-flight command timed out: RedisClient has hard-closed the
+            // connection (a late reply would desync the stream), so it leaves
+            // the pool. The slot map is left alone: a slow reply says nothing
+            // about slot ownership, and invalidating the map on every timeout
+            // turned a slow node into a rediscovery storm for all concurrent
+            // commands. A node that is really gone fails the next connect with
+            // an Io error, which rebuilds the topology (single-flighted).
             if (err.category == RedisErrorCategory::Timeout) {
-                co_await release_pooled(std::move(pc), true);
-                co_await force_rebuild_on_timeout();
+                release_pooled(std::move(pc), true);
                 co_return std::unexpected(err);
             }
 
             if (err.category != RedisErrorCategory::ServerReply) {
-                co_await release_pooled(std::move(pc), true);
+                release_pooled(std::move(pc), true);
                 // Connection died mid-command: one-shot topology rebuild +
                 // retry, like the acquire path. The retry may double-send a
                 // command the dying node already applied — same at-least-once
@@ -892,47 +1061,35 @@ namespace usub::uredis {
                 if (!did_conn_rediscover &&
                     err.category == RedisErrorCategory::Io) {
                     did_conn_rediscover = true;
-                    const auto gen = topology_gen_.load(std::memory_order_acquire);
-                    auto rr = co_await rediscover_slots_serialized(gen);
+                    auto rr = co_await rediscover_slots_serialized(routed_gen, deadline_ms);
                     if (rr)
                         continue;
                 }
                 co_return std::unexpected(err);
             }
 
-            co_await release_pooled(std::move(pc), false);
+            release_pooled(std::move(pc), false);
 
             auto redir_opt = parse_redirection(err.message);
             if (!redir_opt)
                 co_return std::unexpected(err);
 
-            const auto &redir = *redir_opt;
-
-            if (redir.type == RedirType::Moved) {
-                co_await apply_moved(redir);
+            if (redir_opt->type == RedirType::Moved) {
+                co_await apply_moved(*redir_opt);
                 continue;
             }
 
-            if (redir.type == RedirType::Ask) {
-                int ask_to = 0;
-                if (deadline_ms > 0) {
-                    ask_to = remaining();
-                    if (ask_to <= 0) {
-                        co_await force_rebuild_on_timeout();
-                        co_return std::unexpected(
-                            RedisError{RedisErrorCategory::Timeout, "RedisClusterClient: command timeout"});
-                    }
-                }
+            if (redir_opt->type == RedirType::Ask) {
+                if (deadline_ms > 0 && remaining() == 0)
+                    co_return std::unexpected(command_timeout_error(""));
 
-                auto ask_resp = co_await execute_ask(redir, cmd, args, ask_to);
+                auto ask_resp = co_await execute_ask(*redir_opt, cmd, args, deadline_ms);
                 if (ask_resp)
                     co_return ask_resp;
 
                 auto err2 = ask_resp.error();
-                if (err2.category == RedisErrorCategory::Timeout) {
-                    co_await force_rebuild_on_timeout();
+                if (err2.category == RedisErrorCategory::Timeout)
                     co_return std::unexpected(err2);
-                }
 
                 auto redir2 = parse_redirection(err2.message);
                 if (redir2 && redir2->type == RedirType::Moved) {
