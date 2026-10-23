@@ -49,6 +49,11 @@ namespace usub::uredis {
         std::size_t max_connections_per_node{4};
 
         bool force_standalone{false};
+
+        // TLS for every node connection; disabled by default. Nodes are reached by the addresses
+        // CLUSTER SLOTS reports (usually pod IPs) — set tls.server_name to the name the
+        // certificate carries, or include those IPs in its SANs.
+        RedisTlsConfig tls{};
     };
 
     class RedisClusterClient {

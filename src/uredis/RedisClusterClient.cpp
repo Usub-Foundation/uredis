@@ -175,6 +175,7 @@ namespace usub::uredis {
         ncfg.connect_timeout_ms = cfg_.connect_timeout_ms;
         ncfg.io_timeout_ms = cfg_.io_timeout_ms;
         ncfg.command_timeout_ms = cfg_.command_timeout_ms;
+        ncfg.tls = cfg_.tls;
 
         nodes_.push_back(std::make_shared<Node>(ncfg, cfg_.max_connections_per_node));
         return static_cast<int>(nodes_.size() - 1);
@@ -192,6 +193,7 @@ namespace usub::uredis {
                 ncfg.connect_timeout_ms = cfg_.connect_timeout_ms;
                 ncfg.io_timeout_ms = cfg_.io_timeout_ms;
                 ncfg.command_timeout_ms = cfg_.command_timeout_ms;
+                ncfg.tls = cfg_.tls;
 
                 nodes_.push_back(std::make_shared<Node>(ncfg, cfg_.max_connections_per_node));
             }
@@ -230,6 +232,7 @@ namespace usub::uredis {
         cfg.connect_timeout_ms = cfg_.connect_timeout_ms;
         cfg.io_timeout_ms = cfg_.io_timeout_ms;
         cfg.command_timeout_ms = cfg_.command_timeout_ms;
+        cfg.tls = cfg_.tls;
 
 #ifdef UREDIS_LOGS
         ulog::warn("connect_to_node: cluster_pass={} local_pass={}",

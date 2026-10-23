@@ -33,6 +33,9 @@ namespace usub::uredis
         // Optional total budget for a single command, forwarded to each
         // underlying RedisClient. 0 = disabled (legacy behavior).
         int command_timeout_ms{0};
+
+        // TLS for every pooled connection; disabled by default.
+        RedisTlsConfig tls{};
     };
 
     class RedisPool

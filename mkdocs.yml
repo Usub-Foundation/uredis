@@ -58,6 +58,7 @@ nav:
       - Sentinel Support: sentinel.md
       - Redis Cluster Client: cluster.md
       - Redlock Distributed Locks: redlock.md
+      - TLS: tls.md
   - Internals:
       - RESP Parser & Types: internals.md
   - Examples: examples.md

@@ -23,6 +23,7 @@ namespace usub::uredis
             rc.connect_timeout_ms = this->cfg_.connect_timeout_ms;
             rc.io_timeout_ms = this->cfg_.io_timeout_ms;
             rc.command_timeout_ms = this->cfg_.command_timeout_ms;
+            rc.tls = this->cfg_.tls;
 
             this->clients_.push_back(std::make_shared<RedisClient>(rc));
         }

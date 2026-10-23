@@ -73,6 +73,27 @@ namespace usub::uredis
         }
 
         this->socket_.set_timeout_ms(this->config_.io_timeout_ms);
+
+        if (this->config_.tls.enabled)
+        {
+            auto session = detail::TlsSession::create(this->config_.tls, this->config_.host);
+            if (!session)
+            {
+                this->socket_.shutdown();
+                co_return std::unexpected(session.error());
+            }
+            this->tls_ = std::move(*session);
+            auto hs = co_await this->tls_->handshake(this->socket_, this->config_.io_timeout_ms > 0
+                                                                        ? this->config_.io_timeout_ms
+                                                                        : 5000);
+            if (!hs)
+            {
+                this->socket_.shutdown();
+                this->tls_.reset();
+                co_return std::unexpected(hs.error());
+            }
+        }
+
         this->connected_ = true;
         this->closing_ = false;
 
@@ -103,7 +124,7 @@ namespace usub::uredis
             auto frame = encode_command("AUTH", span_args);
             {
                 auto w = co_await this->write_mutex_.lock();
-                auto wrsz = co_await this->socket_.async_write(frame.data(), frame.size());
+                auto wrsz = co_await this->write_frame(frame);
                 this->socket_.update_timeout(this->config_.io_timeout_ms);
                 if (wrsz <= 0 || static_cast<std::size_t>(wrsz) != frame.size())
                 {
@@ -122,7 +143,7 @@ namespace usub::uredis
                                         std::span<const std::string_view>(args_arr, 1));
 
             auto w = co_await this->write_mutex_.lock();
-            auto wrsz = co_await this->socket_.async_write(frame.data(), frame.size());
+            auto wrsz = co_await this->write_frame(frame);
             this->socket_.update_timeout(this->config_.io_timeout_ms);
             if (wrsz <= 0 || static_cast<std::size_t>(wrsz) != frame.size())
             {
@@ -155,7 +176,7 @@ namespace usub::uredis
 
         {
             auto w = co_await this->write_mutex_.lock();
-            auto wrsz = co_await this->socket_.async_write(frame.data(), frame.size());
+            auto wrsz = co_await this->write_frame(frame);
             this->socket_.update_timeout(this->config_.io_timeout_ms);
             if (wrsz <= 0 || static_cast<std::size_t>(wrsz) != frame.size())
             {
@@ -189,7 +210,7 @@ namespace usub::uredis
 
         {
             auto w = co_await this->write_mutex_.lock();
-            auto wrsz = co_await this->socket_.async_write(frame.data(), frame.size());
+            auto wrsz = co_await this->write_frame(frame);
             this->socket_.update_timeout(this->config_.io_timeout_ms);
             if (wrsz <= 0 || static_cast<std::size_t>(wrsz) != frame.size())
             {
@@ -221,7 +242,7 @@ namespace usub::uredis
 
         {
             auto w = co_await this->write_mutex_.lock();
-            auto wrsz = co_await this->socket_.async_write(frame.data(), frame.size());
+            auto wrsz = co_await this->write_frame(frame);
             this->socket_.update_timeout(this->config_.io_timeout_ms);
             if (wrsz <= 0 || static_cast<std::size_t>(wrsz) != frame.size())
             {
@@ -253,7 +274,7 @@ namespace usub::uredis
 
         {
             auto w = co_await this->write_mutex_.lock();
-            auto wrsz = co_await this->socket_.async_write(frame.data(), frame.size());
+            auto wrsz = co_await this->write_frame(frame);
             this->socket_.update_timeout(this->config_.io_timeout_ms);
             if (wrsz <= 0 || static_cast<std::size_t>(wrsz) != frame.size())
             {
@@ -409,6 +430,16 @@ namespace usub::uredis
         }
     }
 
+    task::Awaitable<ssize_t> RedisSubscriber::write_frame(std::vector<std::uint8_t>& frame)
+    {
+        if (this->tls_)
+        {
+            auto tls = this->tls_;
+            co_return co_await tls->write_all(this->socket_, frame.data(), frame.size(), this->config_.io_timeout_ms);
+        }
+        co_return co_await this->socket_.async_write(frame.data(), frame.size());
+    }
+
     task::Awaitable<void> RedisSubscriber::reader_loop()
     {
 #ifdef UREDIS_LOGS
@@ -417,11 +448,21 @@ namespace usub::uredis
         static constexpr std::size_t max_read_size = 64 * 1024;
         DynamicBuffer buf;
         buf.reserve(max_read_size);
+        std::vector<std::uint8_t> plain(this->tls_ ? max_read_size : 0); // TLS only: decrypted bytes
 
         while (!this->closing_)
         {
             buf.clear();
-            ssize_t rdsz = co_await this->socket_.async_read(buf, max_read_size);
+            ssize_t rdsz = 0;
+            if (this->tls_)
+            {
+                auto tls = this->tls_;
+                rdsz = co_await tls->read_some(this->socket_, plain.data(), plain.size(), this->config_.io_timeout_ms);
+            }
+            else
+            {
+                rdsz = co_await this->socket_.async_read(buf, max_read_size);
+            }
             this->socket_.update_timeout(this->config_.io_timeout_ms);
 
             if (rdsz <= 0)
@@ -432,7 +473,10 @@ namespace usub::uredis
                 break;
             }
 
-            this->parser_.feed(reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+            if (this->tls_)
+                this->parser_.feed(plain.data(), static_cast<std::size_t>(rdsz));
+            else
+                this->parser_.feed(reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
 
             while (true)
             {

@@ -70,10 +70,14 @@ namespace usub::uredis
         RedisConfig config_;
 
         net::TCPClientSocket socket_{};
+        std::shared_ptr<detail::TlsSession> tls_{}; // set only when config_.tls.enabled
         bool connected_{false};
         bool closing_{false};
 
         RespParser parser_{};
+
+        // Plain socket or TLS session, whichever the connection uses.
+        task::Awaitable<ssize_t> write_frame(std::vector<std::uint8_t>& frame);
 
         sync::AsyncMutex write_mutex_;
 
